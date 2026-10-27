@@ -1,0 +1,74 @@
+name: build
+
+on:
+  schedule:
+    # 每日 21:40 UTC = 05:40 CST，避开 peach 的 21:30 窗口
+    - cron: '40 21 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve upstream commit
+        id: upstream
+        run: |
+          SHA=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/chigwell/telegram-mcp/commits/main | jq -r .sha)
+          SHORT=${SHA:0:12}
+          echo "upstream commit: $SHA"
+          {
+            echo "sha=$SHA"
+            echo "tag=sha-$SHORT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip when this upstream commit is already built
+        id: check
+        run: |
+          # 登录后 manifest inspect 对私有包也有效，避免把「已构建」误判成「未构建」而天天重建
+          if docker manifest inspect \
+               "ghcr.io/${{ github.repository }}:${{ steps.upstream.outputs.tag }}" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "上游 ${{ steps.upstream.outputs.sha }} 已构建，跳过"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out upstream at pinned commit
+        if: steps.check.outputs.build == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: chigwell/telegram-mcp
+          ref: ${{ steps.upstream.outputs.sha }}
+          fetch-depth: 1
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        if: steps.check.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.upstream.outputs.tag }}
+            ghcr.io/${{ github.repository }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+            org.opencontainers.image.description=chigwell/telegram-mcp built from upstream commit
